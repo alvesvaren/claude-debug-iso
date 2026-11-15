@@ -51,11 +51,14 @@ mkdir -p "$HOME"
 curl -fsSL https://claude.ai/install.sh | bash >/dev/null
 bin=$(readlink -f "$HOME/.local/bin/claude")
 install -Dm755 "$bin" "$PROFILE/airootfs/opt/claude/claude"
-echo "    $("$bin" --version)"
+claude_version=$("$bin" --version | awk '{print $1}')
+echo "    Claude Code $claude_version"
 
 echo "==> Bygger ISO"
 mkdir -p "$OUT"
 mkarchiso -v -r -w "$WORK" -o "$OUT" "$PROFILE"
+# Används av GitHub Actions i releasetexten
+echo "$claude_version" > "$OUT/claude-code-version.txt"
 
 if [[ -n ${HOST_UID:-} ]]; then
     chown -R "$HOST_UID:$HOST_GID" "$OUT"

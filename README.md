@@ -40,6 +40,22 @@ Kräver Docker (bygget körs i en privilegierad `archlinux`-container):
 ISO:n hamnar i `out/`. Claude Code laddas ner och bakas in vid bygget, så bygg
 om för att få en nyare version.
 
+### GitHub Actions
+
+[`.github/workflows/build-iso.yml`](.github/workflows/build-iso.yml) bygger ISO:n
+och publicerar den som en **release** (med `.sha256`):
+
+- manuellt: Actions → *Bygg ISO* → *Run workflow*, eller `gh workflow run build-iso.yml`
+- vid push av en tagg `v*` (sparas permanent)
+- varje måndag, så att Claude Code-versionen hålls färsk. Bara de 3 senaste
+  automatiska byggena (`build-*`) sparas.
+
+Senaste ISO:n hämtas med:
+
+```bash
+gh release download --pattern '*.iso' --repo alvesvaren/claude-debug-iso
+```
+
 Skriv till USB (kontrollera enheten med `lsblk` först):
 
 ```bash
