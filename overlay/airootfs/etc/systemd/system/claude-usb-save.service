@@ -1,0 +1,13 @@
+[Unit]
+Description=Spara Claude-inloggning och konversationer på USB-stickan vid avstängning
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/claude-usb save -q
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

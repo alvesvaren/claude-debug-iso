@@ -9,7 +9,7 @@ av datorer.
 2. `claude-kiosk` startar en helskärmsterminal (`foot` i Wayland-kompositorn
    `cage`) med **svensk tangentbordslayout**. Om grafik inte går att starta körs
    samma flöde i textkonsolen (också med svensk layout, `sv-latin1`).
-3. **Internet:** kabel ansluts automatiskt. Annars visas nätverksskärmen
+3. **Internet:** kabel, och Wi-Fi som finns i `wifi.txt` på stickan, ansluts automatiskt. Annars visas nätverksskärmen
    (`claude-net`), som uppdateras var 5:e sekund:
    - **Wi-Fi:** numrerad lista över nätverk. Tryck siffran och skriv lösenordet.
      `d` för dolt nätverk, `a` för `impala` (t.ex. företagsnät/802.1X).
@@ -28,6 +28,42 @@ av datorer.
    `journalctl`, `smartctl -a` …). När Claude avslutas visas en meny: starta igen,
    fortsätt senaste konversationen, skal, Wi-Fi, logga in på nytt, starta om
    eller stäng av.
+
+## USB-stickan: Wi-Fi, inloggning och körning utan skärm
+
+Ligger ISO:n på en **Ventoy-sticka** används mappen `claude-debug/` på stickan
+(skapas automatiskt första gången, och går att redigera i Windows):
+
+| Fil | Vad |
+| --- | --- |
+| `wifi.txt` | Wi-Fi-nätverk, en rad per nätverk: `namn = lösenord`. Läses in vid start, så att datorn ansluter direkt. Nätverk som du ansluter till via nätverksskärmen läggs till automatiskt. |
+| `claude-data.tgz` | Claude-inloggningen och de 20 senaste konversationerna. Sparas löpande (varje minut vid ändringar, när Claude avslutas och vid avstängning). Med `c` i menyn fortsätter du alltså även efter en omstart. Ta bort filen för att logga ut. |
+| `prompt.txt` | **Körning utan skärm.** Om filen finns kör Claude uppgiften i den och stänger sedan av datorn. Har datorn en skärm kan man trycka på en tangent inom 10 sekunder för att få vanligt läge istället. |
+| `resultat/` | `<datum>_<dator>.md` med Claudes svar och `…-logg.txt` med vad Claude gjorde. Medan körningen pågår står det i svarsfilen var den är eller fastnade, till exempel "Väntar på internet" eller "Inte inloggad". |
+
+Så kör du utan skärm:
+
+1. Starta ISO:n en gång med skärm och logga in med QR-koden. Inloggningen
+   sparas på stickan.
+2. Lägg till Wi-Fi i `wifi.txt`, om datorn inte har kabel.
+3. Skriv uppgiften i `prompt.txt` (se `prompt-exempel.txt`).
+4. Starta datorn från stickan och vänta tills den stänger av sig själv. Läs
+   sedan svaret i `resultat/`.
+
+Utan skärm kör Claude med fulla rättigheter (`--dangerously-skip-permissions`),
+eftersom ingen kan godkänna kommandon. Den har dock instruktioner att inte
+skriva till datorns diskar om inte uppgiften uttryckligen ber om det. Formulera
+prompten därefter.
+
+Utan Ventoy (ISO:n skriven med `dd`) går det att använda en annan USB-sticka
+eller partition med etiketten `CLAUDE_DATA`.
+
+> `wifi.txt` och `claude-data.tgz` ligger okrypterade på stickan. Den som har
+> stickan kan läsa Wi-Fi-lösenorden och använda ditt Claude-konto.
+
+Partitionen monteras bara medan något läses eller skrivs, så stickan kan dras
+ut när som helst. Under Ventoy är partitionen upptagen (Ventoy använder den
+för ISO-filen), och då monteras den via en egen device-mapper-mappning.
 
 ## Bygga
 
@@ -79,6 +115,8 @@ Testa i QEMU:
 | `overlay/airootfs/usr/local/bin/claude-session` | Huvudflödet: nätverk, inloggning, Claude, meny |
 | `overlay/airootfs/usr/local/bin/claude-net` | Nätverksskärmen: Wi-Fi-lista, iPhone-parkoppling, status |
 | `overlay/airootfs/usr/local/bin/claude-qr-login` | QR-inloggning och mobilsidan på LAN:et (port 8484) |
+| `overlay/airootfs/usr/local/bin/claude-usb` | Hittar Ventoy-stickan: `wifi.txt`, sparad inloggning, `prompt.txt`, resultat |
+| `overlay/airootfs/usr/local/bin/claude-headless` | Kör `prompt.txt` med `claude -p` och skriver svaret till stickan |
 | `overlay/airootfs/root/CLAUDE.md` | Instruktioner till Claude om livemiljön |
 | `overlay/airootfs/root/.claude/settings.json` | Tillåtna läskommandon |
 
@@ -95,8 +133,8 @@ Lägg till i bootmenyn (Tab eller `e`):
   AMD Excavator/2015 eller senare). På äldre datorer visas ett meddelande om det
   och du får ett vanligt skal med felsökningsverktygen. I QEMU utan KVM behövs
   `-cpu Haswell-noTSX` eller nyare.
-- Allt ligger i RAM: inloggningen och konversationerna försvinner vid omstart.
-  Rotfilsystemets overlay får använda upp till halva minnet (`cow_spacesize=50%`).
+- Allt ligger i RAM, utom det som sparas på USB-stickan (se ovan). Rotfilsystemets
+  overlay får använda upp till halva minnet (`cow_spacesize=50%`).
 - Utöver releng finns bland annat chntpw/hivex/wimlib/7zip för Windows,
   stress-ng/memtester, fwupd och os-prober/sbctl/mokutil. Hela listan står i
   `overlay/packages.extra`.

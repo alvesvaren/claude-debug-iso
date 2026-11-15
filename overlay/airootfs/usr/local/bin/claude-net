@@ -289,7 +289,7 @@ def connect(station_name, ssid, sec, hidden=False):
         print(f"  {DIM}Tryck på valfri tangent…{RESET}")
         read_key(30)
         return
-    cmd = ["iwctl"]
+    cmd, pw = ["iwctl"], ""
     if sec != "open":
         pw = ask(f"  Lösenord för {BOLD}{ssid}{RESET} (tomt = avbryt): ")
         if not pw:
@@ -308,6 +308,9 @@ def connect(station_name, ssid, sec, hidden=False):
         read_key(30)
         return
     print(f"  {GREEN}Ansluten.{RESET} Hämtar IP-adress…")
+    # Spara i wifi.txt på USB-stickan så att nätverket ansluts automatiskt nästa gång
+    if run(["claude-usb", "save-wifi", ssid, pw], 20)[0] == 0:
+        print(f"  {DIM}Sparat i wifi.txt på USB-stickan.{RESET}")
     for _ in range(15):
         if has_default_route():
             break

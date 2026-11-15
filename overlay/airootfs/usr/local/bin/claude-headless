@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Kör prompt.txt från USB-stickan med Claude utan att någon behöver sitta vid datorn.
+
+Svaret skrivs till claude-debug/resultat/<datum>_<dator>.md på stickan och
+en logg över vad Claude gjorde till ...-logg.txt. Förloppet visas också på
+skärmen om det finns någon.
+
+  claude-headless status TEXT   skriv TEXT som tillfälligt resultat (t.ex.
+                                "väntar på internet") så att man ser på
+                                stickan var det fastnade
+  claude-headless run           kör prompten
+"""
+
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import time
+import unicodedata
+
+BASEFILE = "/run/claude-headless.base"
+FLUSH_EVERY = 30  # sekunder mellan loggskrivningar till stickan
+BOLD, DIM, RED, GREEN, ACCENT, RESET = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[38;5;173m", "\033[0m")
+
+SYSTEM_PROMPT = """\
+Du körs utan skärm, startad från prompt.txt på USB-stickan. Ingen sitter vid \
+datorn: du kan inte ställa frågor och ingen godkänner dina kommandon.
+
+Ditt sista meddelande sparas som rapport (Markdown) på stickan och läses \
+senare på en annan dator. Skriv det på svenska, komplett och begripligt utan \
+resten av konversationen: vad du undersökte, vad du hittade, vad du eventuellt \
+ändrade och vad du rekommenderar.
+
+Du har fulla rättigheter utan godkännande. Skriv därför ingenting till den här \
+datorns diskar (montera read-only, ingen dd/mkfs/wipefs/partitionering/\
+fsck-reparation/efibootmgr-ändring) om inte uppgiften uttryckligen ber om \
+just det. Stäng inte av och starta inte om datorn; det sköts efteråt.\
+"""
+
+
+def put(rel, text):
+    subprocess.run(["claude-usb", "put", rel], input=text.encode(),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def machine():
+    dmi = "/sys/class/dmi/id/"
+    vendor = read(dmi + "sys_vendor")
+    product = read(dmi + "product_version") if read(dmi + "sys_vendor") == "LENOVO" else ""
+    product = product or read(dmi + "product_name")
+    name = " ".join(w for w in (vendor, product) if w and "to be filled" not in w.lower())
+    return name or "okänd dator"
+
+
+def base():
+    """Filnamnet för den här körningen (samma för status och resultat)."""
+    b = read(BASEFILE)
+    if not b:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H%M")
+        ascii_name = unicodedata.normalize("NFKD", machine()).encode("ascii", "ignore").decode()
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", ascii_name).strip("-")[:40] or "dator"
+        b = f"{stamp}_{slug}"
+        with open(BASEFILE, "w") as f:
+            f.write(b)
+    return b
+
+
+def header(prompt):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    quoted = "\n".join("> " + l for l in prompt.splitlines())
+    return f"# Claude Debug ISO · {machine()}\n\n{now}\n\n**Uppgift (prompt.txt):**\n\n{quoted}\n\n---\n\n"
+
+
+def get_prompt():
+    p = subprocess.run(["claude-usb", "prompt"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def cmd_status(text):
+    put(f"resultat/{base()}.md", header(get_prompt()) + f"**Status:** {text}\n")
+    return 0
+
+
+def short(value, width=110):
+    s = " ".join(str(value).split())
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def describe_tool(name, inp):
+    for key in ("command", "file_path", "pattern", "path", "url", "query", "description"):
+        if key in inp:
+            return f"{name}: {short(inp[key])}"
+    return name
+
+
+def cmd_run():
+    prompt = get_prompt()
+    if not prompt:
+        print("Hittade ingen prompt.txt på stickan.")
+        return 1
+    b = base()
+    result_path, log_path = f"resultat/{b}.md", f"resultat/{b}-logg.txt"
+    head = header(prompt)
+    put(result_path, head + "**Status:** Claude arbetar…\n")
+
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 0
+    cols = cols if cols >= 40 else 100
+    print(f"  {BOLD}Kör prompt.txt från USB-stickan{RESET} {DIM}(svaret sparas i "
+          f"claude-debug/{result_path}){RESET}\n")
+    lines = [w for para in prompt.splitlines() for w in textwrap.wrap(para, cols - 6) or [""]]
+    for line in lines[:12] + (["…"] if len(lines) > 12 else []):
+        print(f"  {DIM}│{RESET} {line}")
+    print()
+
+    log = [f"Uppgift:\n{prompt}\n"]
+    env = dict(os.environ, IS_SANDBOX="1")  # tillåter --dangerously-skip-permissions som root
+    proc = subprocess.Popen(
+        ["claude", "-p", "--output-format", "stream-json", "--verbose",
+         "--dangerously-skip-permissions", "--append-system-prompt", SYSTEM_PROMPT],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env, cwd="/root")
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+
+    final, last_flush, other = None, time.monotonic(), []
+    for line in proc.stdout:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            other.append(line.rstrip())
+            print(f"  {DIM}{line.rstrip()}{RESET}")
+            continue
+        t = ev.get("type")
+        if t == "assistant":
+            for c in ev.get("message", {}).get("content", []):
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    log.append(c["text"].strip())
+                    for para in c["text"].strip().splitlines():
+                        for w in textwrap.wrap(para, cols - 4) or [""]:
+                            print(f"  {w}")
+                elif c.get("type") == "tool_use":
+                    d = describe_tool(c.get("name", "?"), c.get("input") or {})
+                    log.append(f"▸ {d}")
+                    print(f"  {ACCENT}▸{RESET} {DIM}{short(d, cols - 6)}{RESET}")
+        elif t == "user":
+            for c in ev.get("message", {}).get("content", []):
+                if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
+                    msg = c.get("content")
+                    msg = msg if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False)
+                    log.append(f"  ✗ {short(msg, 300)}")
+                    print(f"    {RED}✗ {short(msg, cols - 8)}{RESET}")
+        elif t == "result":
+            final = ev
+        if time.monotonic() - last_flush > FLUSH_EVERY:
+            last_flush = time.monotonic()
+            put(log_path, "\n\n".join(log) + "\n")
+    rc = proc.wait()
+
+    if final and not final.get("is_error") and final.get("result"):
+        ok, body = True, final["result"].strip() + "\n"
+        status = f"{GREEN}{BOLD}Klart.{RESET}"
+    else:
+        reason = (final or {}).get("result") or (final or {}).get("subtype") or "\n".join(other[-20:])
+        ok, body = False, f"**Körningen misslyckades** (kod {rc}).\n\n```\n{reason or 'okänt fel'}\n```\n"
+        status = f"{RED}{BOLD}Körningen misslyckades.{RESET}"
+    meta = ""
+    if final:
+        meta = (f"\n---\n\n<sub>{final.get('num_turns', '?')} steg · "
+                f"{round(final.get('duration_ms', 0) / 60000, 1)} min · "
+                f"session {final.get('session_id', '?')} (fortsätt med `claude --resume` på ISO:n)</sub>\n")
+    put(result_path, head + body + meta)
+    put(log_path, "\n\n".join(log) + "\n")
+    print(f"\n  {status} Svaret är sparat i {BOLD}claude-debug/{result_path}{RESET} på stickan.")
+    return 0 if ok else 1
+
+
+def main(argv):
+    if argv[:1] == ["status"] and len(argv) > 1:
+        return cmd_status(" ".join(argv[1:]))
+    if argv[:1] == ["run"]:
+        return cmd_run()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

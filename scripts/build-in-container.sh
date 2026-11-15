@@ -30,6 +30,8 @@ file_permissions+=(
   ["/usr/local/bin/claude-session"]="0:0:755"
   ["/usr/local/bin/claude-qr-login"]="0:0:755"
   ["/usr/local/bin/claude-net"]="0:0:755"
+  ["/usr/local/bin/claude-usb"]="0:0:755"
+  ["/usr/local/bin/claude-headless"]="0:0:755"
   ["/opt/claude/claude"]="0:0:755"
   ["/root/.claude"]="0:0:700"
 )

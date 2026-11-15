@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Sparar saker på USB-stickan som ISO:n startades från.
+
+Letar upp Ventoy-partitionen (etikett "Ventoy"), eller en partition med
+etiketten CLAUDE_DATA, och använder mappen claude-debug/ där:
+
+  wifi.txt          Wi-Fi-nätverk ("namn = lösenord"), läses in i iwd vid start
+                    och fylls på när man ansluter via nätverksskärmen.
+  prompt.txt        Finns den körs Claude utan skärm (claude-headless).
+  resultat/         Svar och loggar från prompt.txt-körningar.
+  claude-data.tgz   Inloggningen och de senaste konversationerna.
+
+Partitionen monteras bara medan något läses eller skrivs, så att stickan
+kan dras ut när som helst utan att filsystemet blir skadat.
+
+Under Ventoy är partitionen upptagen (Ventoy pekar ut ISO-filen med
+device-mapper), så då monteras den via en egen linjär dm-mappning.
+
+  claude-usb restore          läs in wifi.txt och claude-data.tgz
+  claude-usb save [-q]        spara inloggning/konversationer om de ändrats
+  claude-usb save-wifi SSID [LÖSENORD]
+  claude-usb prompt           skriv ut prompt.txt (exit 1 om den saknas)
+  claude-usb put SÖKVÄG       skriv stdin till claude-debug/SÖKVÄG
+  claude-usb where            skriv ut vilken partition som används
+"""
+
+import contextlib
+import fcntl
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+
+MOUNTPOINT = "/run/claude-usb"
+LOCK = "/run/claude-usb.lock"
+SIGFILE = "/run/claude-usb.sig"
+DIRNAME = "claude-debug"
+LABELS = ("ventoy", "claude_data", "claude-data")
+HOME = "/root"
+IWD_DIR = "/var/lib/iwd"
+STATE = "claude-data.tgz"
+KEEP_SESSIONS = 20
+
+WIFI_TEMPLATE = """\
+# Wi-Fi-nätverk som Claude Debug ISO ansluter till automatiskt.
+# En rad per nätverk:   nätverksnamn = lösenord
+# Öppet nätverk:        nätverksnamn =
+# Nätverk du ansluter till via nätverksskärmen läggs till här automatiskt.
+"""
+
+PROMPT_EXAMPLE = """\
+Döp om den här filen till prompt.txt för att köra Claude utan skärm och
+tangentbord. Hela filens innehåll skickas som uppgift till Claude, och
+svaret hamnar i mappen resultat/. Datorn stängs av när Claude är klar.
+
+Exempel på en uppgift:
+
+Ta reda på varför den här datorn inte startar Windows. Ändra ingenting,
+skriv bara en rapport med vad du hittade och vad du föreslår.
+"""
+
+README = """\
+Claude Debug ISO använder den här mappen på stickan:
+
+  wifi.txt            Wi-Fi-nätverk och lösenord (namn = lösenord).
+  prompt.txt          Om den finns kör Claude uppgiften i filen utan skärm
+                      och stänger av datorn när den är klar.
+                      Se prompt-exempel.txt.
+  resultat/           Svar och loggar från prompt.txt-körningar.
+  claude-data.tgz     Claude-inloggningen och de senaste konversationerna.
+                      Ta bort filen för att logga ut.
+
+OBS: wifi.txt och claude-data.tgz är okrypterade. Den som har stickan kan
+läsa Wi-Fi-lösenorden och använda Claude-kontot.
+"""
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+# --- Hitta och montera partitionen ----------------------------------------
+
+def ventoy_disks():
+    """Namn på enheterna som /dev/mapper/ventoy (ISO-filen) ligger på."""
+    p = run(["dmsetup", "deps", "-o", "devname", "ventoy"])
+    return set(re.findall(r"\(([^)]+)\)", p.stdout)) if p.returncode == 0 else set()
+
+
+def candidates():
+    p = run(["lsblk", "-Jpo", "NAME,LABEL,FSTYPE,TYPE,PKNAME"])
+    if p.returncode != 0:
+        return []
+    found = []
+
+    def probe(d):
+        # lsblk tar etiketten från udev; fråga blkid direkt om den saknas
+        if d.get("label") is None:
+            out = run(["blkid", "-p", "-o", "export", d["name"]]).stdout
+            info = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+            d["label"], d["fstype"] = info.get("LABEL"), info.get("TYPE")
+        return d
+
+    def walk(devs):
+        for d in devs:
+            if d.get("type") == "part" and (probe(d).get("label") or "").lower() in LABELS:
+                found.append(d)
+            walk(d.get("children") or [])
+
+    walk(json.loads(p.stdout).get("blockdevices", []))
+    on_ventoy = ventoy_disks()
+    # Partitionen på samma disk som ISO:n först
+    found.sort(key=lambda d: not ({os.path.basename(d["name"]),
+                                   os.path.basename(d.get("pkname") or "")} & on_ventoy))
+    return found
+
+
+def try_mount(dev, fstype):
+    fstype = {"ntfs": "ntfs3"}.get(fstype, fstype)
+    opts = "noatime,iocharset=utf8" if fstype in ("vfat", "exfat", "ntfs3") else "noatime"
+    args = ["mount", "-o", opts]
+    if fstype:
+        args += ["-t", fstype]
+    return run(args + [dev, MOUNTPOINT]).returncode == 0
+
+
+def mount():
+    os.makedirs(MOUNTPOINT, exist_ok=True)
+    if os.path.ismount(MOUNTPOINT):
+        return True
+    for d in candidates():
+        dev, fstype = d["name"], d.get("fstype")
+        if try_mount(dev, fstype):
+            return True
+        # Upptagen (Ventoy): montera via en egen dm-mappning av hela partitionen
+        mapped = "/dev/mapper/claude-usb-" + os.path.basename(dev)
+        if not os.path.exists(mapped):
+            size = run(["blockdev", "--getsz", dev]).stdout.strip()
+            if not size.isdigit():
+                continue
+            run(["dmsetup", "create", os.path.basename(mapped),
+                 "--table", f"0 {size} linear {dev} 0"])
+            run(["udevadm", "settle", "-t", "5"])
+        if os.path.exists(mapped) and try_mount(mapped, fstype):
+            return True
+    return False
+
+
+@contextlib.contextmanager
+def usb():
+    """Monterar stickan och ger claude-debug-mappen, eller None."""
+    if not mount():
+        yield None
+        return
+    try:
+        path = os.path.join(MOUNTPOINT, DIRNAME)
+        os.makedirs(path, exist_ok=True)
+        yield path
+    finally:
+        os.sync()
+        run(["umount", MOUNTPOINT])
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data if isinstance(data, bytes) else data.encode())
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_text(path):
+    """Text från en fil som kan vara sparad i Anteckningar (BOM, UTF-16, CRLF)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16")
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# --- Wi-Fi -----------------------------------------------------------------
+
+def parse_wifi_line(line):
+    """(ssid, lösenord) från 'namn = lösenord' eller '"namn med =" = lösenord'."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    m = re.fullmatch(r'"([^"]+)"\s*=(.*)', line) or re.fullmatch(r"([^=]+)=(.*)", line)
+    if not m or not m.group(1).strip():
+        return None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def parse_wifi(text):
+    return [n for n in map(parse_wifi_line, (text or "").splitlines()) if n]
+
+
+def iwd_filename(ssid, open_net):
+    # Samma namngivning som iwd: klartext om det går, annars =hex
+    name = ssid if re.fullmatch(r"[A-Za-z0-9_ -]+", ssid) else "=" + ssid.encode().hex()
+    return os.path.join(IWD_DIR, name + (".open" if open_net else ".psk"))
+
+
+def load_wifi(nets):
+    os.makedirs(IWD_DIR, mode=0o700, exist_ok=True)
+    loaded = 0
+    for ssid, pw in nets:
+        if pw and not 8 <= len(pw) <= 63:
+            continue
+        path = iwd_filename(ssid, not pw)
+        content = f"[Security]\nPassphrase={pw}\n" if pw else "[Settings]\nAutoConnect=true\n"
+        if not os.path.exists(path):
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                f.write(content)
+        loaded += 1
+    return loaded
+
+
+def cmd_save_wifi(ssid, pw):
+    with usb() as d:
+        if not d:
+            return 1
+        path = os.path.join(d, "wifi.txt")
+        lines = (read_text(path) or WIFI_TEMPLATE).splitlines()
+        name = f'"{ssid}"' if re.search(r'[="]|^[#\s]|\s$', ssid) else ssid
+        entry = f"{name} = {pw}".rstrip()
+        for i, line in enumerate(lines):
+            net = parse_wifi_line(line)
+            if net and net[0] == ssid:
+                if line == entry:
+                    return 0
+                lines[i] = entry
+                break
+        else:
+            lines.append(entry)
+        write_atomic(path, "\r\n".join(lines) + "\r\n")
+    return 0
+
+
+# --- Inloggning och konversationer -----------------------------------------
+
+def state_files():
+    files = [".claude.json", ".claude/.credentials.json", ".claude/history.jsonl"]
+    files = [f for f in files if os.path.isfile(os.path.join(HOME, f))]
+    projects = os.path.join(HOME, ".claude/projects")
+    sessions = {}  # (projekt, sessions-id) -> [(mtime, relativ sökväg)]
+    for root, _, names in os.walk(projects):
+        for n in names:
+            full = os.path.join(root, n)
+            rel = os.path.relpath(full, HOME)
+            parts = os.path.relpath(full, projects).split(os.sep)
+            if len(parts) < 2:
+                continue
+            key = (parts[0], parts[1].removesuffix(".jsonl"))
+            sessions.setdefault(key, []).append((os.path.getmtime(full), rel))
+    newest = sorted(sessions.values(), key=lambda fs: max(m for m, _ in fs), reverse=True)
+    for group in newest[:KEEP_SESSIONS]:
+        files += [rel for _, rel in group]
+    return files
+
+
+def signature(files):
+    h = hashlib.sha256()
+    for f in files:
+        with contextlib.suppress(OSError):
+            st = os.stat(os.path.join(HOME, f))
+            h.update(f"{f}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
+def cmd_save(quiet):
+    files = state_files()
+    sig = signature(files)
+    try:
+        if open(SIGFILE).read() == sig:
+            return 0
+    except OSError:
+        pass
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tar:
+        for f in files:
+            with contextlib.suppress(OSError):  # kan ha försvunnit under tiden
+                tar.add(os.path.join(HOME, f), arcname=f, recursive=False)
+    with usb() as d:
+        if not d:
+            return 1
+        write_atomic(os.path.join(d, STATE), buf.getvalue())
+    with open(SIGFILE, "w") as f:
+        f.write(sig)
+    if not quiet:
+        print("Sparat på USB-stickan.")
+    return 0
+
+
+def cmd_restore():
+    with usb() as d:
+        if not d:
+            return 1
+        print(f"USB-sticka: {DIRNAME}/ på {where_name()}")
+        for name, content in (("LASMIG.txt", README), ("prompt-exempel.txt", PROMPT_EXAMPLE),
+                              ("wifi.txt", WIFI_TEMPLATE)):
+            path = os.path.join(d, name)
+            if not os.path.exists(path):
+                write_atomic(path, content.replace("\n", "\r\n"))
+
+        n = load_wifi(parse_wifi(read_text(os.path.join(d, "wifi.txt"))))
+        if n:
+            print(f"Wi-Fi: {n} sparade nätverk från wifi.txt")
+
+        state = os.path.join(d, STATE)
+        if os.path.exists(state):
+            try:
+                with tarfile.open(state) as tar:
+                    tar.extractall(HOME, filter="data")
+                if os.path.exists(os.path.join(HOME, ".claude/.credentials.json")):
+                    print("Claude-inloggning: hämtad från stickan")
+            except (OSError, tarfile.TarError) as e:
+                print(f"Kunde inte läsa {STATE}: {e}")
+    with open(SIGFILE, "w") as f:
+        f.write(signature(state_files()))
+    return 0
+
+
+def where_name():
+    src = run(["findmnt", "-no", "SOURCE", MOUNTPOINT]).stdout.strip()
+    return src or "?"
+
+
+def cmd_prompt():
+    with usb() as d:
+        text = read_text(os.path.join(d, "prompt.txt")) if d else None
+    if not text or not text.strip():
+        return 1
+    sys.stdout.write(text.strip() + "\n")
+    return 0
+
+
+def cmd_put(rel):
+    data = sys.stdin.buffer.read()
+    with usb() as d:
+        if not d:
+            return 1
+        path = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_atomic(path, data)
+    return 0
+
+
+def cmd_where():
+    with usb() as d:
+        if not d:
+            return 1
+        print(where_name())
+    return 0
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if cmd == "restore":
+            return cmd_restore()
+        if cmd == "save":
+            return cmd_save("-q" in args)
+        if cmd == "save-wifi" and args:
+            return cmd_save_wifi(args[0], args[1] if len(args) > 1 else "")
+        if cmd == "prompt":
+            return cmd_prompt()
+        if cmd == "put" and args:
+            return cmd_put(args[0])
+        if cmd == "where":
+            return cmd_where()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

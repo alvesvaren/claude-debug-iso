@@ -13,6 +13,11 @@ oftast svenska.
 - Pacmans databaser är inte synkade i avbilden. Behöver du verktyg som saknas:
   `pacman -Sy <paket>` (paketcachen ligger i RAM).
 - Nätverk: systemd-networkd + iwd (`iwctl`, eller TUI:n `impala`), systemd-resolved.
+- USB-stickan som ISO:n startades från (Ventoy) har mappen `claude-debug/`, där
+  inloggning, Wi-Fi (`wifi.txt`) och resultat sparas. Den monteras bara
+  tillfälligt. Vill användaren spara något på stickan:
+  `claude-usb put resultat/<namn> < fil` (sökvägen är relativ till `claude-debug/`).
+  Rör inte ISO-filerna eller resten av stickan.
 - Finns redan:
   - Diskar: smartctl, nvme, hdparm, ddrescue, partclone, fsarchiver, testdisk/photorec,
     cryptsetup, lvm2, mdadm, btrfs/xfs/ntfs/exfat/f2fs-verktyg.

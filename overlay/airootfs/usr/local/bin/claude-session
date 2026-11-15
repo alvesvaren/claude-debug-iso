@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Huvudflödet i kiosken: internet → inloggning (QR) → Claude Code.
+# Huvudflödet i kiosken: USB-stickan → internet → inloggning (QR) → Claude Code.
+# Finns prompt.txt på stickan körs den utan skärm (claude-headless) istället.
 
 cd /root || exit 1
 
 bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' green=$'\e[32m'
 accent=$'\e[38;5;173m' reset=$'\e[0m'
+
+HAVE_USB=0   # claude-debug/ på Ventoy-stickan hittades
+HEADLESS=0   # prompt.txt ska köras
 
 banner() {
     clear
@@ -16,7 +20,31 @@ shell() {
     zsh -i
 }
 
+save() { (( HAVE_USB )) && claude-usb save -q; }
+
+# Skriv var vi är i resultatfilen på stickan, så att man ser vad som hände
+# även om ingen tittade på skärmen.
+hstatus() { (( HEADLESS )) && claude-headless status "$1"; }
+
 reachable() { curl -s -o /dev/null --max-time 6 https://api.anthropic.com/; }
+
+# Läser in wifi.txt och sparad inloggning från stickan, och kollar prompt.txt.
+load_usb() {
+    local out
+    out=$(claude-usb restore 2>&1) || return
+    HAVE_USB=1
+    printf '  %s%s%s\n' "$dim" "${out//$'\n'/$'\n  '}" "$reset"
+    claude-usb prompt >/dev/null || return
+    echo
+    echo "  ${bold}prompt.txt${reset} finns på stickan: Claude kör uppgiften och stänger sedan av datorn."
+    echo "  ${dim}Tryck på valfri tangent inom 10 sekunder för vanligt läge istället.${reset}"
+    if read -rsn1 -t 10; then
+        echo "  Vanligt läge."
+    else
+        HEADLESS=1
+        hstatus "Startar…"
+    fi
+}
 
 # Kabel/USB-delning brukar ge DHCP inom några sekunder; vänta lite innan vi
 # visar nätverksskärmen (claude-net), som sedan guidar till Wi-Fi eller iPhone.
@@ -31,6 +59,7 @@ ensure_network() {
         sleep 1
     done
     echo
+    hstatus "Väntar på internet. Sätt i en nätverkskabel eller lägg till Wi-Fi-nätverket i wifi.txt på stickan."
     until claude-net; do :; done
     banner
     echo "  Internet ${green}✓${reset}"
@@ -40,6 +69,7 @@ ensure_network() {
 # utan. Säg det tydligt och ge ett skal istället för en obegriplig krasch.
 check_cpu() {
     grep -qw avx2 /proc/cpuinfo && return
+    hstatus "Processorn saknar AVX2, som Claude Code kräver. Prompten kan inte köras på den här datorn."
     local key
     while true; do
         banner
@@ -70,6 +100,7 @@ ensure_claude() {
 ensure_login() {
     local key
     until claude auth status >/dev/null 2>&1; do
+        hstatus "Inte inloggad. Starta en gång med skärm och logga in med QR-koden; inloggningen sparas sedan på stickan."
         banner
         claude-qr-login && continue
         echo
@@ -78,33 +109,58 @@ ensure_login() {
         read -rsn1 key
         [[ $key == [sS] ]] && shell
     done
+    save
 }
 
 banner
+load_usb
 check_cpu
 ensure_network
 ensure_claude
 ensure_login
 
+# Spara inloggning och konversationer på stickan medan Claude körs, så att
+# inget går förlorat om någon drar ur sladden (claude-usb hoppar över
+# oförändrat). Sparas också vid avstängning (claude-usb-save.service).
+if (( HAVE_USB )); then
+    ( while sleep 60; do claude-usb save -q; done ) &
+    saver=$!
+    trap 'kill $saver 2>/dev/null' EXIT
+fi
+
 next=(claude)
-while true; do
-    clear
-    "${next[@]}"
-    next=(claude)
+if (( HEADLESS )); then
+    banner
+    claude-headless run
+    save
     echo
-    echo "  ${bold}Claude avslutades.${reset}"
+    echo "  Stänger av om 60 sekunder. ${dim}Tryck på valfri tangent för att stanna kvar.${reset}"
+    read -rsn1 -t 60 || systemctl poweroff
+    next=()
+fi
+
+while true; do
+    if (( ${#next[@]} )); then
+        clear
+        "${next[@]}"
+        save
+        echo
+        echo "  ${bold}Claude avslutades.${reset}"
+    fi
+    next=(claude)
     echo
     echo "  ${bold}[Enter]${reset} Starta igen     ${bold}[c]${reset} Fortsätt senaste konversationen"
     echo "  ${bold}[s]${reset} Skal            ${bold}[w]${reset} Nätverk   ${bold}[l]${reset} Logga in på nytt"
     echo "  ${bold}[r]${reset} Starta om       ${bold}[p]${reset} Stäng av"
+    (( HAVE_USB )) && echo "  ${dim}Inloggning, konversationer och Wi-Fi sparas på USB-stickan (claude-debug/).${reset}"
     key=
     read -rsn1 key
     case $key in
         c|C) next=(claude --continue) ;;
         s|S) shell ;;
         w|W) claude-net --manage ;;
-        l|L) claude auth logout; ensure_login ;;
-        r|R) systemctl reboot ;;
-        p|P) systemctl poweroff ;;
+        l|L) claude auth logout; save; ensure_login ;;
+        r|R) save; systemctl reboot ;;
+        p|P) save; systemctl poweroff ;;
     esac
 done
