@@ -1,0 +1,33 @@
+# Läggs till releng-profilens packages.x86_64 vid bygget.
+
+# Kiosk: Wayland-kompositor + terminal med riktig Unicode
+cage
+foot
+ttf-dejavu
+noto-fonts-emoji
+wl-clipboard
+
+# Inloggning och nätverk
+qrencode
+python
+impala
+libimobiledevice
+usbmuxd
+
+# Felsökningsverktyg (utöver det releng redan har)
+git
+jq
+htop
+strace
+lsof
+pciutils
+lshw
+iperf3
+mtr
+traceroute
+ripgrep
+fd
+tree
+wget
+unzip
+ncdu

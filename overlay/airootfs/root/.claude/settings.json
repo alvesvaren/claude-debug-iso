@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lsblk:*)",
+      "Bash(blkid:*)",
+      "Bash(findmnt:*)",
+      "Bash(df:*)",
+      "Bash(free:*)",
+      "Bash(uname:*)",
+      "Bash(dmesg:*)",
+      "Bash(journalctl:*)",
+      "Bash(systemctl status:*)",
+      "Bash(ip addr:*)",
+      "Bash(ip -br:*)",
+      "Bash(ip route:*)",
+      "Bash(ip link:*)",
+      "Bash(lspci:*)",
+      "Bash(lsusb:*)",
+      "Bash(lsmod:*)",
+      "Bash(lscpu:*)",
+      "Bash(lshw:*)",
+      "Bash(dmidecode:*)",
+      "Bash(smartctl -a:*)",
+      "Bash(smartctl -x:*)",
+      "Bash(nvme list:*)",
+      "Bash(nvme smart-log:*)",
+      "Bash(efibootmgr)",
+      "Bash(efibootmgr -v)",
+      "Bash(sensors:*)",
+      "Bash(ping:*)",
+      "Bash(resolvectl:*)"
+    ]
+  }
+}

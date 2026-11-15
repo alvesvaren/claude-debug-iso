@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Startar kiosken: claude-session i foot under cage (Wayland, svensk layout).
+# Om grafik inte går att starta körs samma flöde direkt i textkonsolen
+# (svensk layout via /etc/vconsole.conf). Tvinga textläge med kernelparametern
+# claude.notty.
+
+export XKB_DEFAULT_LAYOUT=se
+
+want_gui() {
+    grep -qw 'claude.notty' /proc/cmdline && return 1
+    # Ge udev några sekunder att ladda grafikdrivrutinen
+    for _ in {1..10}; do
+        compgen -G '/dev/dri/card*' >/dev/null && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+if want_gui; then
+    # Mjukvarurendering: fungerar på i princip all hårdvara och i VM:ar,
+    # och en terminal behöver ingen GPU.
+    export WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1
+    start=$SECONDS
+    cage -s -- foot --title Claude claude-session 2>/tmp/cage.log
+    # Körde den en stund var det ett avsiktligt avslut, inte ett startfel.
+    (( SECONDS - start > 15 )) && exit 0
+    echo "Grafikläget kunde inte starta (se /tmp/cage.log), kör i textkonsolen istället."
+    sleep 3
+fi
+
+exec claude-session

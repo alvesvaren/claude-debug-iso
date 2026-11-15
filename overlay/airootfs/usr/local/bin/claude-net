@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Guidad nätverksanslutning för kiosken.
+
+Visar status för kabel, Wi-Fi och mobil via USB, listar Wi-Fi-nätverk med
+nummer och ansluter med bara siffra + lösenord. En iPhone via USB
+parkopplas automatiskt och skärmen säger vad man ska göra på telefonen.
+
+Avslutar med 0 så fort internet fungerar. Med --manage visas skärmen även
+när man redan är ansluten (för att byta nätverk) och q går tillbaka.
+"""
+
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+BOLD, DIM, RED, GREEN, YELLOW, ACCENT, RESET = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[38;5;173m", "\033[0m")
+REFRESH = 5         # sekunder mellan omritningar
+SCAN_EVERY = 15     # sekunder mellan aktiva Wi-Fi-sökningar
+MAX_LISTED = 9
+TEST_URL = "https://api.anthropic.com/"
+
+IPHONE_HELP = {
+    "unpaired": "Lås upp iPhonen och tryck på \"Lita på\" (Trust) när frågan dyker upp.",
+    "passcode": "Lås upp iPhonen med din kod.",
+    "denied": "Du tryckte \"Lita inte på\". Dra ur kabeln, sätt i den igen och tryck \"Lita på\".",
+    "paired": "Slå på Inställningar → Internetdelning → \"Tillåt andra att ansluta\".\n"
+              "      Hjälper inte det: dra ur kabeln och sätt i den igen.",
+}
+
+
+def run(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, str(e)
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# --- Internet ------------------------------------------------------------
+
+def online():
+    if run(["curl", "-s", "-o", "/dev/null", "--max-time", "5", TEST_URL], 8)[0] == 0:
+        return True
+    # Fel systemklocka ger TLS-fel. Når vi servern utan certifikatkontroll
+    # sätter vi tiden från Date-headern och försöker igen.
+    rc, out = run(["curl", "-skI", "--max-time", "5", TEST_URL], 8)
+    m = re.search(r"^date: (.+?)\r?$", out, re.I | re.M)
+    if rc == 0 and m and run(["date", "-s", m.group(1)])[0] == 0:
+        return run(["curl", "-s", "-o", "/dev/null", "--max-time", "5", TEST_URL], 8)[0] == 0
+    return False
+
+
+def has_default_route():
+    return bool(run(["ip", "route", "show", "default"])[1].strip())
+
+
+# --- Gränssnitt ----------------------------------------------------------
+
+def interfaces():
+    """[(namn, sort, uppe, ipv4)] för alla fysiska nätverkskort."""
+    result = []
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return result
+    for name in names:
+        base = f"/sys/class/net/{name}"
+        if name == "lo" or not os.path.exists(f"{base}/device"):
+            continue
+        driver = os.path.basename(os.path.realpath(f"{base}/device/driver"))
+        if os.path.exists(f"{base}/wireless"):
+            kind = "Wi-Fi"
+        elif driver == "ipheth":
+            kind = "iPhone"
+        elif driver in ("rndis_host", "cdc_ncm", "cdc_ether", "cdc_mbim", "qmi_wwan"):
+            kind = "Mobil (USB)"
+        else:
+            kind = "Kabel"
+        up = read_file(f"{base}/carrier") == "1"
+        m = re.search(r"inet (\S+)/", run(["ip", "-4", "-o", "addr", "show", "dev", name])[1])
+        result.append((name, kind, up, m.group(1) if m else None))
+    return result
+
+
+# --- iPhone --------------------------------------------------------------
+
+def iphone_connected():
+    try:
+        devices = os.listdir("/sys/bus/usb/devices")
+    except OSError:
+        return None
+    for dev in devices:
+        base = f"/sys/bus/usb/devices/{dev}"
+        if read_file(f"{base}/idVendor") == "05ac":
+            product = read_file(f"{base}/product") or ""
+            if "iPhone" in product or "iPad" in product:
+                return product
+    return None
+
+
+_pair_state = {"state": None, "at": 0.0}
+
+
+def iphone_state():
+    """unpaired | passcode | denied | paired, med parkoppling i bakgrunden."""
+    now = time.monotonic()
+    if _pair_state["state"] == "paired" or now - _pair_state["at"] < REFRESH - 1:
+        return _pair_state["state"] or "unpaired"
+    _pair_state["at"] = now
+    run(["systemctl", "start", "usbmuxd"], 5)
+    rc, out = run(["idevicepair", "validate"], 8)
+    if rc != 0:
+        rc, out = run(["idevicepair", "pair"], 8)
+    if rc == 0 or "SUCCESS" in out:
+        state = "paired"
+    elif "passcode" in out:
+        state = "passcode"
+    elif "denied" in out:
+        state = "denied"
+    else:
+        state = "unpaired"
+    _pair_state["state"] = state
+    return state
+
+
+# --- Wi-Fi (iwd via D-Bus) -----------------------------------------------
+
+def busctl(*args):
+    rc, out = run(["busctl", "--json=short", *args], 8)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)["data"]
+    except (ValueError, KeyError):
+        return None
+
+
+def wifi_station():
+    """(objektsökväg, gränssnittsnamn) för första Wi-Fi-kortet, eller None."""
+    data = busctl("call", "net.connman.iwd", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+    if not data:
+        return None, None
+    objs = data[0]
+    for path, ifaces in sorted(objs.items()):
+        if "net.connman.iwd.Station" in ifaces:
+            name = ifaces.get("net.connman.iwd.Device", {}).get("Name", {}).get("data")
+            return objs, (path, name)
+    return objs, None
+
+
+def wifi_networks(objs, station_path):
+    """[(ssid, säkerhet, staplar 1-4, ansluten)] sorterat efter signal."""
+    data = busctl("call", "net.connman.iwd", station_path, "net.connman.iwd.Station", "GetOrderedNetworks")
+    if not data:
+        return []
+    seen, result = set(), []
+    for net_path, signal in data[0]:
+        props = objs.get(net_path, {}).get("net.connman.iwd.Network", {})
+        ssid = props.get("Name", {}).get("data")
+        if not ssid or ssid in seen:
+            continue
+        seen.add(ssid)
+        dbm = signal / 100
+        bars = 4 if dbm >= -60 else 3 if dbm >= -67 else 2 if dbm >= -75 else 1
+        result.append((ssid, props.get("Type", {}).get("data", "psk"),
+                       bars, bool(props.get("Connected", {}).get("data"))))
+    return result
+
+
+_last_scan = [0.0]
+
+
+def maybe_scan(station_name):
+    if time.monotonic() - _last_scan[0] > SCAN_EVERY:
+        _last_scan[0] = time.monotonic()
+        subprocess.Popen(["iwctl", "station", station_name, "scan"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- Terminal ------------------------------------------------------------
+
+def read_key(timeout):
+    """Ett tangenttryck (eller None vid timeout) utan att behöva Enter."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ready, _, _ = select.select([fd], [], [], timeout)
+        return os.read(fd, 32).decode(errors="ignore") if ready else None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def ask(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def run_interactive(cmd):
+    try:
+        subprocess.run(cmd)
+    except OSError as e:
+        print(f"  {RED}{e}{RESET}")
+        time.sleep(2)
+
+
+def clear():
+    print("\033[H\033[2J", end="")
+
+
+# --- Skärmen -------------------------------------------------------------
+
+def draw(status_line, ifaces, iphone, wifi_dev, networks, manage):
+    clear()
+    print(f"\n  {ACCENT}{BOLD}✻ Claude Debug ISO{RESET}  {DIM}· nätverk{RESET}\n")
+    print(f"  {status_line}\n")
+
+    print(f"  {BOLD}Anslutningar{RESET}")
+    if not ifaces and not iphone:
+        print(f"    {DIM}Inga nätverkskort hittades.{RESET}")
+    wifi_ssid = next((ssid for ssid, _, _, connected in networks if connected), None)
+    for name, kind, up, ip in ifaces:
+        if ip:
+            state = f"{GREEN}ansluten{RESET} {DIM}{ip}{RESET}"
+        elif kind == "Wi-Fi" and wifi_dev and name == wifi_dev[1] and wifi_ssid:
+            state = f"{YELLOW}ansluten till {wifi_ssid}, väntar på IP-adress…{RESET}"
+        elif kind == "Wi-Fi":
+            state = f"{DIM}inte ansluten{RESET}"
+        elif up:
+            state = f"{YELLOW}väntar på IP-adress…{RESET}"
+        else:
+            state = f"{DIM}ingen sladd{RESET}" if kind == "Kabel" else f"{DIM}inte ansluten{RESET}"
+        print(f"    {kind:<12} {DIM}{name:<16}{RESET} {state}")
+    if iphone:
+        product, state = iphone
+        has_iface = any(k == "iPhone" and ip for _, k, _, ip in ifaces)
+        if not has_iface:
+            print(f"    {'iPhone':<12} {DIM}{product:<16}{RESET} {YELLOW}hittad via USB{RESET}")
+            print(f"      → {IPHONE_HELP[state]}")
+    print()
+
+    if wifi_dev:
+        print(f"  {BOLD}Wi-Fi-nätverk{RESET}")
+        if not networks:
+            print(f"    {DIM}Söker…{RESET}")
+        for i, (ssid, sec, bars, connected) in enumerate(networks[:MAX_LISTED], 1):
+            lock = "öppet" if sec == "open" else "företag" if sec == "8021x" else "lösenord"
+            mark = f"  {GREEN}✓ ansluten{RESET}" if connected else ""
+            print(f"    {BOLD}{i}{RESET}  {ssid[:32]:<32}  {'█' * bars}{'░' * (4 - bars)}  {DIM}{lock}{RESET}{mark}")
+        print()
+
+    keys = []
+    if wifi_dev and networks:
+        n = min(len(networks), MAX_LISTED)
+        keys.append(f"{BOLD}[{'1' if n == 1 else f'1-{n}'}]{RESET} Anslut")
+    if wifi_dev:
+        keys.append(f"{BOLD}[d]{RESET} Dolt nätverk")
+        keys.append(f"{BOLD}[a]{RESET} Avancerat Wi-Fi")
+    keys += [f"{BOLD}[s]{RESET} Skal", f"{BOLD}[p]{RESET} Stäng av"]
+    if manage:
+        keys.append(f"{BOLD}[q]{RESET} Tillbaka")
+    print("  " + "   ".join(keys))
+    print()
+    print(f"  {DIM}Kabel, iPhone eller Android (USB-internetdelning) kan kopplas in när som helst;{RESET}")
+    print(f"  {DIM}skärmen uppdateras var {REFRESH}:e sekund.{RESET}")
+
+
+def connect(station_name, ssid, sec, hidden=False):
+    print()
+    if sec == "8021x":
+        print(f"  {YELLOW}{ssid} kräver företagsinloggning (802.1X). Använd [a] Avancerat Wi-Fi.{RESET}")
+        print(f"  {DIM}Tryck på valfri tangent…{RESET}")
+        read_key(30)
+        return
+    cmd = ["iwctl"]
+    if sec != "open":
+        pw = ask(f"  Lösenord för {BOLD}{ssid}{RESET} (tomt = avbryt): ")
+        if not pw:
+            return
+        cmd += ["--passphrase", pw]
+    cmd += ["station", station_name, "connect-hidden" if hidden else "connect", ssid]
+    print(f"  Ansluter till {ssid}…")
+    rc, out = run(cmd, 45)
+    if rc != 0:
+        # iwctl skickar med terminalkoder; behåll bara första textraden
+        plain = re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", out)
+        msg = next((l.strip() for l in plain.splitlines() if l.strip()), "okänt fel")
+        hint = " Fel lösenord?" if sec != "open" else ""
+        print(f"  {RED}Kunde inte ansluta ({msg}).{RESET}{hint}")
+        print(f"  {DIM}Tryck på valfri tangent…{RESET}")
+        read_key(30)
+        return
+    print(f"  {GREEN}Ansluten.{RESET} Hämtar IP-adress…")
+    for _ in range(15):
+        if has_default_route():
+            break
+        time.sleep(1)
+
+
+def main():
+    manage = "--manage" in sys.argv
+    run(["rfkill", "unblock", "all"])
+    status = f"{DIM}Kontrollerar internet…{RESET}"
+    while True:
+        ifaces = interfaces()
+        product = iphone_connected()
+        iphone = (product, iphone_state()) if product else None
+        if not product:
+            _pair_state.update(state=None, at=0.0)
+        objs, station = wifi_station()
+        networks = []
+        if station:
+            maybe_scan(station[1])
+            networks = wifi_networks(objs, station[0])
+
+        is_online = has_default_route() and online()
+        if is_online and not manage:
+            print(f"  {GREEN}Internet ✓{RESET}")
+            return 0
+        status = (f"{GREEN}{BOLD}Internet fungerar ✓{RESET}" if is_online
+                  else f"{RED}{BOLD}Ingen internetanslutning.{RESET} Välj ett sätt att ansluta:")
+        draw(status, ifaces, iphone, station, networks, manage)
+
+        key = read_key(REFRESH)
+        if not key:
+            continue
+        key = key[0].lower()
+        if key.isdigit() and station and 1 <= int(key) <= min(len(networks), MAX_LISTED):
+            ssid, sec, _, _ = networks[int(key) - 1]
+            connect(station[1], ssid, sec)
+        elif key == "d" and station:
+            print()
+            ssid = ask("  Nätverksnamn (SSID, tomt = avbryt): ").strip()
+            if ssid:
+                connect(station[1], ssid, "psk", hidden=True)
+        elif key == "a" and station:
+            clear()
+            print(f"  {DIM}Piltangenter för att välja, Enter för att ansluta, q för att gå tillbaka.{RESET}")
+            time.sleep(1)
+            run_interactive(["impala"])
+        elif key == "s":
+            clear()
+            print(f"  {DIM}Skriv 'exit' för att gå tillbaka.{RESET}")
+            run_interactive(["zsh", "-i"])
+        elif key == "p":
+            run(["systemctl", "poweroff"])
+        elif key == "q" and manage:
+            return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

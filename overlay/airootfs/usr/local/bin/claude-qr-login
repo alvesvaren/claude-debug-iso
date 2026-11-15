@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Logga in Claude Code med mobilen.
+
+Kör `claude auth login` i en pty, plockar ut inloggningslänken och visar den
+som QR-kod. Koden som claude.com visar efter inloggningen kan sedan antingen
+skrivas in på tangentbordet eller klistras in på en liten webbsida som den
+här datorn serverar på det lokala nätet (också nåbar via QR-kod).
+
+Extra argument skickas vidare till `claude auth login`, t.ex. --console.
+"""
+
+import html
+import http.server
+import os
+import pty
+import re
+import secrets
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import fcntl
+import threading
+import urllib.parse
+
+PORT = int(os.environ.get("CLAUDE_QR_PORT", "8484"))
+URL_RE = re.compile(rb"https://[^\s\x07\x1b]+/oauth/authorize\?[^\s\x07\x1b]+")
+PROMPT_RE = re.compile(rb"Paste code here if prompted > ?")
+
+BOLD, DIM, ACCENT, GREEN, RESET = "\033[1m", "\033[2m", "\033[38;5;173m", "\033[32m", "\033[0m"
+
+
+def lan_ip():
+    try:
+        out = subprocess.run(
+            ["ip", "-4", "route", "get", "1.1.1.1"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"\bsrc (\S+)", out)
+    return m.group(1) if m else None
+
+
+def qr_lines(data):
+    """QR-kod som rader av halvblock, med explicita färger så att den går
+    att skanna oavsett terminalens färgtema."""
+    out = subprocess.run(
+        ["qrencode", "-t", "UTF8", "-m", "2", "-o", "-", data],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return out.rstrip("\n").split("\n")
+
+
+def paint(line):
+    return f"\033[97;40m{line}{RESET}"
+
+
+def render_blocks(blocks, gap=6):
+    """blocks: lista av (rubrik, rader). Placeras bredvid varandra om det får
+    plats, annars under varandra."""
+    cols = shutil.get_terminal_size((80, 24)).columns
+    widths = [max(len(t), max(len(l) for l in lines)) for t, lines in blocks]
+    out = []
+    if sum(widths) + gap * (len(blocks) - 1) + 4 <= cols:
+        height = max(len(lines) for _, lines in blocks)
+        out.append("  " + (" " * gap).join(f"{BOLD}{t.ljust(w)}{RESET}" for (t, _), w in zip(blocks, widths)))
+        for i in range(height):
+            parts = []
+            for (_, lines), w in zip(blocks, widths):
+                if i < len(lines):
+                    parts.append(paint(lines[i]) + " " * (w - len(lines[i])))
+                else:
+                    parts.append(" " * w)
+            out.append("  " + (" " * gap).join(parts))
+    else:
+        for t, lines in blocks:
+            out.append(f"  {BOLD}{t}{RESET}")
+            out.extend("  " + paint(l) for l in lines)
+            out.append("")
+    return "\n".join(out)
+
+
+PAGE = """<!doctype html>
+<html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Logga in Claude Code</title>
+<style>
+ body{{font-family:system-ui,sans-serif;max-width:32rem;margin:0 auto;padding:1.5rem;
+      background:#faf9f5;color:#141413;line-height:1.5}}
+ @media (prefers-color-scheme:dark){{body{{background:#1f1e1d;color:#f5f4ee}}}}
+ h1{{font-size:1.4rem}} ol{{padding-left:1.2rem}}
+ a.btn,button{{display:block;width:100%;box-sizing:border-box;text-align:center;font-size:1.1rem;
+      padding:.9rem;border-radius:.6rem;border:0;background:#d97757;color:#fff;
+      text-decoration:none;margin:.6rem 0 1.4rem;cursor:pointer}}
+ input{{width:100%;box-sizing:border-box;font-size:1rem;padding:.8rem;border-radius:.6rem;
+      border:1px solid #888;background:transparent;color:inherit}}
+</style></head><body>
+<h1>Logga in Claude Code på {host}</h1>
+<ol><li>Logga in och kopiera koden du får.</li>
+<li>Kom tillbaka hit, klistra in koden och skicka.</li></ol>
+<a class="btn" href="{url}" target="_blank" rel="noopener">1. Logga in hos Claude</a>
+<form method="post"><input name="code" autocomplete="off" autocapitalize="off"
+ spellcheck="false" placeholder="Klistra in koden här" required>
+<button>2. Skicka koden till datorn</button></form>
+</body></html>"""
+
+DONE_PAGE = """<!doctype html><html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Klart</title></head>
+<body style="font-family:system-ui,sans-serif;padding:1.5rem">
+<h1>Koden skickades</h1><p>Titta på datorns skärm. Du kan stänga den här sidan.</p></body></html>"""
+
+
+def start_server(token, login_url, notify_w):
+    host = html.escape(os.uname().nodename)
+    page = PAGE.format(url=html.escape(login_url, quote=True), host=host).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, status, body):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self):
+            return self.path.rstrip("/") == "/" + token
+
+        def do_GET(self):
+            if not self._authorized():
+                return self._send(404, b"Not found")
+            self._send(200, page)
+
+        def do_POST(self):
+            if not self._authorized():
+                return self._send(404, b"Not found")
+            length = min(int(self.headers.get("Content-Length") or 0), 8192)
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode(errors="replace"))
+            code = "".join(form.get("code", [""])[0].split())
+            if not code:
+                return self._send(200, page)
+            os.write(notify_w, code.encode() + b"\n")
+            self._send(200, DONE_PAGE.encode())
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError:
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def pick_view(login_url, lan_url):
+    """'both' om båda QR-koderna får plats på höjden, annars börjar vi med den
+    lilla LAN-koden och låter Enter växla till inloggningskoden."""
+    if not lan_url:
+        return "direct"
+    size = shutil.get_terminal_size((80, 24))
+    big, small = qr_lines(login_url), qr_lines(lan_url)
+    # QR-koderna bredvid varandra + rubrikrad, två instruktionsrader och prompt
+    fits_wide = len(big[0]) + len(small[0]) + 6 + 4 <= size.columns
+    fits_high = len(big) + 4 <= size.lines
+    return "both" if fits_wide and fits_high else "lan"
+
+
+def screen_lines(text, cols):
+    """Antal skärmrader text tar, inklusive radbrytningar."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    return sum(max(1, -(-len(line) // cols)) for line in plain.split("\n"))
+
+
+def show_login_screen(login_url, lan_url, view):
+    """Ritar om skärmen. QR-koden och prompten måste alltid få plats helt
+    (en avklippt QR-kod går inte att skanna); rubrik och länkar tas bara med
+    om det finns rader över."""
+    size = shutil.get_terminal_size((80, 24))
+    if view == "both":
+        qr = render_blocks([
+            ("Skanna för att logga in", qr_lines(login_url)),
+            ("…eller allt i ett (samma nätverk)", qr_lines(lan_url)),
+        ])
+        text = [
+            "  1. Skanna QR-koden till vänster, logga in och kopiera koden du får.",
+            f"  2. Skriv in koden här, {BOLD}eller{RESET} skanna den högra koden och klistra in den i mobilen.",
+        ]
+    elif view == "lan":
+        qr = render_blocks([("Skanna med mobilen (samma nätverk som datorn)", qr_lines(lan_url))])
+        text = [
+            "  Sidan låter dig logga in och skicka tillbaka koden hit.",
+            f"  {DIM}Mobilen på ett annat nätverk? Tryck Enter för att visa inloggningslänken som QR.{RESET}",
+        ]
+    else:
+        qr = render_blocks([("Skanna för att logga in", qr_lines(login_url))])
+        text = ["  Logga in med mobilen, kopiera koden du får och skriv in den här."]
+        if lan_url:
+            text.append(f"  {DIM}Tryck Enter för att växla tillbaka till den andra QR-koden.{RESET}")
+
+    extras = []
+    if lan_url:
+        extras.append(f"  {DIM}Mobilsida: {lan_url}{RESET}")
+    extras.append(f"  {DIM}Ingen mobil? Länken: {login_url}{RESET}")
+
+    qr_height = screen_lines(qr, size.columns)
+    if qr_height + 2 > size.lines:
+        # Får inte plats ens utan text; i foot kan man krympa texten och
+        # skärmen ritas då om (SIGWINCH).
+        text = [f"  {BOLD}QR-koden får inte plats: gör texten mindre med Ctrl + minus.{RESET}"]
+
+    # Rader kvar när QR, instruktioner och promptraden är placerade
+    budget = size.lines - qr_height - 1
+    budget -= sum(screen_lines(t, size.columns) for t in text)
+    for line in list(extras):
+        h = screen_lines(line, size.columns)
+        if h <= budget:
+            budget -= h
+        else:
+            extras.remove(line)
+    spacer = budget >= 2  # tomrad före och efter instruktionerna
+    if spacer:
+        budget -= 2
+    title = budget >= 3
+
+    out = []
+    if title:
+        out += ["", f"  {ACCENT}{BOLD}Logga in på Claude{RESET}", ""]
+    out.append(qr)
+    if spacer:
+        out.append("")
+    out += text + extras
+    if spacer:
+        out.append("")
+    print("\033[H\033[2J" + "\n".join(out))
+    print(f"  {BOLD}Kod>{RESET} ", end="", flush=True)
+
+
+def main():
+    pid, fd = pty.fork()
+    if pid == 0:
+        # Låt bli att försöka öppna en webbläsare (xdg-open skulle annars
+        # kunna starta lynx i terminalen).
+        os.environ["BROWSER"] = "true"
+        os.execvp("claude", ["claude", "auth", "login", *sys.argv[1:]])
+
+    # Bred pty så att länken aldrig radbryts
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 2000, 0, 0))
+
+    notify_r, notify_w = os.pipe()
+    resize_r, resize_w = os.pipe()
+    signal.signal(signal.SIGWINCH, lambda *_: os.write(resize_w, b"x"))
+    buf = b""
+    login_url = None
+    code_sent = None
+    server = None
+    stdin_open = True
+    view = None
+    lan_url = None
+
+    def send_code(code):
+        nonlocal code_sent, server
+        code_sent = code.encode()
+        os.write(fd, code_sent + b"\r")
+        if server:
+            threading.Thread(target=server.shutdown, daemon=True).start()
+            server = None
+        print(f"\n  {DIM}Loggar in…{RESET}", flush=True)
+
+    try:
+        while True:
+            watch = [fd, notify_r, resize_r] + ([sys.stdin] if stdin_open else [])
+            ready, _, _ = select.select(watch, [], [])
+            if resize_r in ready:
+                os.read(resize_r, 64)
+                if login_url and not code_sent:
+                    if view == "both" or pick_view(login_url, lan_url) == "both":
+                        view = pick_view(login_url, lan_url)
+                    show_login_screen(login_url, lan_url, view)
+            if fd in ready:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:  # EIO: barnet har stängt pty:n
+                    data = b""
+                if not data:
+                    break
+                if login_url is None:
+                    buf += data
+                    m = URL_RE.search(buf)
+                    if m:
+                        login_url = m.group(0).decode()
+                        token = secrets.token_urlsafe(8)
+                        ip = lan_ip()
+                        server = start_server(token, login_url, notify_w) if ip else None
+                        lan_url = f"http://{ip}:{PORT}/{token}" if server else None
+                        view = pick_view(login_url, lan_url)
+                        show_login_screen(login_url, lan_url, view)
+                elif code_sent:
+                    data = PROMPT_RE.sub(b"", data.replace(code_sent, b""))
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+            if notify_r in ready:
+                code = os.read(notify_r, 8192).decode().split("\n")[0]
+                if code and not code_sent:
+                    print(f"{DIM}(mottagen från mobilen){RESET}", end="")
+                    send_code(code)
+            if stdin_open and sys.stdin in ready:
+                line = sys.stdin.readline()
+                if not line:
+                    stdin_open = False
+                    continue
+                code = "".join(line.split())
+                if code and login_url and not code_sent:
+                    send_code(code)
+                elif login_url and not code_sent:
+                    if view != "both":
+                        view = {"lan": "direct", "direct": "lan"}[view] if lan_url else "direct"
+                        show_login_screen(login_url, lan_url, view)
+                    else:
+                        print(f"  {BOLD}Kod>{RESET} ", end="", flush=True)
+    except KeyboardInterrupt:
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        print()
+        return 130
+    finally:
+        if server:
+            server.shutdown()
+
+    _, status = os.waitpid(pid, 0)
+    rc = os.waitstatus_to_exitcode(status)
+    if login_url is None:
+        # Något gick fel innan länken visades; visa vad claude skrev.
+        sys.stdout.buffer.write(buf)
+        sys.stdout.flush()
+    if rc == 0:
+        print(f"\n  {GREEN}✓ Inloggad!{RESET}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

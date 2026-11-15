@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Huvudflödet i kiosken: internet → inloggning (QR) → Claude Code.
+
+cd /root || exit 1
+
+bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' green=$'\e[32m'
+accent=$'\e[38;5;173m' reset=$'\e[0m'
+
+banner() {
+    clear
+    printf '\n  %s%s✻ Claude Debug ISO%s\n\n' "$accent" "$bold" "$reset"
+}
+
+shell() {
+    echo "  ${dim}Skriv 'exit' för att gå tillbaka.${reset}"
+    zsh -i
+}
+
+reachable() { curl -s -o /dev/null --max-time 6 https://api.anthropic.com/; }
+
+# Kabel/USB-delning brukar ge DHCP inom några sekunder; vänta lite innan vi
+# visar nätverksskärmen (claude-net), som sedan guidar till Wi-Fi eller iPhone.
+ensure_network() {
+    printf '  Väntar på internet'
+    for _ in {1..8}; do
+        if reachable; then
+            printf ' %s✓%s\n' "$green" "$reset"
+            return
+        fi
+        printf '.'
+        sleep 1
+    done
+    echo
+    until claude-net; do :; done
+    banner
+    echo "  Internet ${green}✓${reset}"
+}
+
+# Claude Code-binären (Bun) kräver AVX2 och kraschar med "illegal instruction"
+# utan. Säg det tydligt och ge ett skal istället för en obegriplig krasch.
+check_cpu() {
+    grep -qw avx2 /proc/cpuinfo && return
+    local key
+    while true; do
+        banner
+        echo "  ${red}${bold}Den här datorns processor saknar AVX2, som Claude Code kräver.${reset}"
+        echo "  (Intel Haswell/2013, AMD Excavator/2015 eller senare.)"
+        echo
+        echo "  Felsökningsverktygen på skivan fungerar ändå."
+        echo
+        echo "  ${bold}[s]${reset} Skal   ${bold}[r]${reset} Starta om   ${bold}[p]${reset} Stäng av"
+        key=
+        read -rsn1 key
+        case $key in
+            r|R) systemctl reboot ;;
+            p|P) systemctl poweroff ;;
+            *) shell ;;
+        esac
+    done
+}
+
+ensure_claude() {
+    [[ -x /opt/claude/claude ]] && return
+    echo "  Claude Code saknas i avbilden, installerar…"
+    curl -fsSL https://claude.ai/install.sh | bash \
+        && mkdir -p /opt/claude \
+        && ln -sf "$(readlink -f /root/.local/bin/claude)" /opt/claude/claude
+}
+
+ensure_login() {
+    local key
+    until claude auth status >/dev/null 2>&1; do
+        banner
+        claude-qr-login && continue
+        echo
+        echo "  ${red}Inloggningen misslyckades.${reset}  ${bold}[Enter]${reset} Försök igen   ${bold}[s]${reset} Skal"
+        key=
+        read -rsn1 key
+        [[ $key == [sS] ]] && shell
+    done
+}
+
+banner
+check_cpu
+ensure_network
+ensure_claude
+ensure_login
+
+next=(claude)
+while true; do
+    clear
+    "${next[@]}"
+    next=(claude)
+    echo
+    echo "  ${bold}Claude avslutades.${reset}"
+    echo
+    echo "  ${bold}[Enter]${reset} Starta igen     ${bold}[c]${reset} Fortsätt senaste konversationen"
+    echo "  ${bold}[s]${reset} Skal            ${bold}[w]${reset} Nätverk   ${bold}[l]${reset} Logga in på nytt"
+    echo "  ${bold}[r]${reset} Starta om       ${bold}[p]${reset} Stäng av"
+    key=
+    read -rsn1 key
+    case $key in
+        c|C) next=(claude --continue) ;;
+        s|S) shell ;;
+        w|W) claude-net --manage ;;
+        l|L) claude auth logout; ensure_login ;;
+        r|R) systemctl reboot ;;
+        p|P) systemctl poweroff ;;
+    esac
+done
