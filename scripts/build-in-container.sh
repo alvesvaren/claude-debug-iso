@@ -35,10 +35,11 @@ file_permissions+=(
 )
 EOF
 
-# Bootmenyer: eget namn, större RAM-overlay (för pacman -S under felsökning)
+# Bootmenyer: eget namn, RAM-overlay på halva minnet (tmpfs tar bara det som
+# faktiskt skrivs; standard är 256M, för lite för pacman -S under felsökning)
 # och kortare väntetid.
 sed -i -e 's/Arch Linux install medium/Claude Debug ISO/g' \
-       -e 's/%KERNEL_PARAMS%/cow_spacesize=2G %KERNEL_PARAMS%/g' \
+       -e 's/%KERNEL_PARAMS%/cow_spacesize=50% %KERNEL_PARAMS%/g' \
     "$PROFILE"/efiboot/loader/entries/*.conf "$PROFILE"/syslinux/*.cfg "$PROFILE"/grub/*.cfg
 sed -i 's/^timeout .*/timeout 3/' "$PROFILE/efiboot/loader/loader.conf"
 sed -i 's/^TIMEOUT .*/TIMEOUT 30/' "$PROFILE/syslinux/archiso_sys.cfg"

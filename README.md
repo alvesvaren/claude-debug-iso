@@ -96,6 +96,10 @@ Lägg till i bootmenyn (Tab eller `e`):
   och du får ett vanligt skal med felsökningsverktygen. I QEMU utan KVM behövs
   `-cpu Haswell-noTSX` eller nyare.
 - Allt ligger i RAM: inloggningen och konversationerna försvinner vid omstart.
+  Rotfilsystemets overlay får använda upp till halva minnet (`cow_spacesize=50%`).
+- Utöver releng finns bland annat chntpw/hivex/wimlib/7zip för Windows,
+  stress-ng/memtester, fwupd och os-prober/sbctl/mokutil. Hela listan står i
+  `overlay/packages.extra`.
 - Mobilsidan för inloggning skyddas av en slumpad token i länken och stängs så
   fort en kod har skickats.
 - Textstorlek i foot: `Ctrl` + `+` eller `Ctrl` + `-`.

@@ -31,3 +31,23 @@ tree
 wget
 unzip
 ncdu
+inxi
+lm_sensors
+upower
+
+# Windows: lösenord/register offline, WIM-avbilder, arkiv.
+# (BitLocker låses upp med cryptsetup --type bitlk, som redan finns.)
+chntpw
+hivex
+wimlib
+7zip
+
+# Hårdvarutest och firmware
+stress-ng
+memtester
+fwupd
+
+# Boot och Secure Boot
+os-prober
+sbctl
+mokutil
